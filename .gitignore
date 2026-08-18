@@ -1,0 +1,12 @@
+# JRE installer binary (68 MB) - not tracked in git.
+# Must be placed alongside Deploy.bat before deployment, or Step 2 silently skips.
+jre-8u*-windows-i586.exe
+jre-8u*-windows-x64.exe
+
+# Deployment / runtime artifacts
+*.log
+*-Backup-*
+deploy_*.log
+
+# Claude Code local session config (machine-specific)
+.claude/settings.local.json

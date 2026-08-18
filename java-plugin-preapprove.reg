@@ -1,0 +1,5 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Ext\PreApproved\{8AD9C840-044E-11D1-B3E9-00805F499D93}]
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Ext\PreApproved\{8AD9C840-044E-11D1-B3E9-00805F499D93}]
