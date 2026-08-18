@@ -83,6 +83,7 @@ $JavaRootDir = Join-Path $JavaRootDir "Java"
 $script:Failures       = @()
 $script:Warnings       = @()
 $script:RebootRequired = $false
+$script:LastOutput     = ""   # stdout/stderr of the last Invoke-Tracked -Capture call
 
 $Interactive = $true
 try { $Interactive = -not [Console]::IsOutputRedirected } catch { $Interactive = $false }
@@ -98,6 +99,27 @@ function Write-Info      { param($Text) Write-Host "   -> $Text" -ForegroundColo
 function Write-Skip      { param($Text) Write-Host "   -> SKIPPED: $Text" -ForegroundColor DarkGray }
 function Write-Attention { param($Text) Write-Host "   -> WARNING: $Text" -ForegroundColor Yellow }
 function Write-Bad       { param($Text) Write-Host "   -> FAILED: $Text" -ForegroundColor Red }
+
+# Echoes a captured child process's output through Write-Host so Start-Transcript
+# records it. Blank lines are dropped and long output is capped, to keep the log usable.
+function Write-CapturedOutput {
+    param(
+        [string] $Label,
+        [string] $Text,
+        [int]    $MaxLines = 40,
+        [string] $Colour = "Gray"
+    )
+    if (-not $Text) { return }
+    $lines = @($Text -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+    if ($lines.Count -eq 0) { return }
+    Write-Host "      --- $Label ---" -ForegroundColor $Colour
+    $shown = $lines
+    if ($lines.Count -gt $MaxLines) { $shown = $lines[0..($MaxLines - 1)] }
+    foreach ($l in $shown) { Write-Host "      $($l.TrimEnd())" -ForegroundColor $Colour }
+    if ($lines.Count -gt $MaxLines) {
+        Write-Host "      ... $($lines.Count - $MaxLines) more line(s) suppressed" -ForegroundColor $Colour
+    }
+}
 
 # Spinner for work with no measurable duration (registry writes, file drops).
 function Show-TextSpinner {
@@ -124,21 +146,29 @@ function Invoke-Tracked {
         [string] $Text,
         [string] $FilePath,
         [string] $Arguments = "",
-        [int[]]  $SuccessCodes = @(0)
+        [int[]]  $SuccessCodes = @(0),
+        # Capture the child's stdout/stderr into $script:LastOutput. Without this the
+        # child writes straight to the console, where Start-Transcript CANNOT see it -
+        # which is why the IE Mode fix used to leave no trace of what it did in the log.
+        [switch] $Capture
     )
     $spin = @('-', '\', '|', '/')
+    $script:LastOutput = ""
     Write-Host -NoNewline "   -> $Text  "
 
     # Built with ProcessStartInfo instead of "Start-Process -PassThru": the latter
     # does not reliably retain the process handle, so $proc.ExitCode reads back as
     # empty once the process has exited - which would make every single step look
     # like a failure. A directly-created Process owns its handle, so ExitCode is
-    # valid after exit. UseShellExecute=$false also means console children (cscript,
-    # certutil, reg) share this console, so their output lands in the transcript.
+    # valid after exit.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName        = $FilePath
     $psi.Arguments       = $Arguments
     $psi.UseShellExecute = $false
+    if ($Capture) {
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+    }
 
     $proc = $null
     try {
@@ -153,6 +183,16 @@ function Invoke-Tracked {
         return $null
     }
 
+    # Start BOTH async reads before waiting. Draining only one pipe - or reading
+    # synchronously after the wait - deadlocks as soon as the child fills the other
+    # pipe's buffer and blocks on write while we block on exit.
+    $outTask = $null
+    $errTask = $null
+    if ($Capture) {
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+    }
+
     $i = 0
     while (-not $proc.HasExited) {
         if ($Interactive) { try { [Console]::Write("`b" + $spin[$i % 4]) } catch { } }
@@ -161,6 +201,14 @@ function Invoke-Tracked {
     }
     $proc.WaitForExit()
     if ($Interactive) { try { [Console]::Write("`b") } catch { } }
+
+    if ($Capture) {
+        try {
+            $script:LastOutput = (($outTask.Result + "`r`n" + $errTask.Result)).Trim()
+        } catch {
+            $script:LastOutput = ""
+        }
+    }
 
     $code = $proc.ExitCode
     if ($SuccessCodes -contains $code) {
@@ -501,10 +549,13 @@ if ($certs.Count -gt 0) {
     foreach ($cert in $certs) {
         $code = Invoke-Tracked -Text "Installing Certificate: $($cert.Name)..." `
                                -FilePath "certutil.exe" `
-                               -Arguments "-addstore -f `"Root`" `"$($cert.FullName)`""
+                               -Arguments "-addstore -f `"Root`" `"$($cert.FullName)`"" `
+                               -Capture
         if ($code -eq 0) {
             Write-Ok "Certificate $($cert.Name) installed successfully!"
         } else {
+            # Only on failure - certutil is verbose and would bury the log on success
+            Write-CapturedOutput -Label "certutil output" -Text $script:LastOutput -Colour "Red"
             Add-Failure "Step 3" "certutil failed on $($cert.Name) (exit $code)"
         }
     }
@@ -675,8 +726,21 @@ AddPages=$SiteUrl/forms/frmservlet
 
     $code = Invoke-Tracked -Text "Applying IE Mode Expiry Fix (all profiles)..." `
                            -FilePath "cscript.exe" `
-                           -Arguments "//nologo `"$ieFixFile`" `"$iniPath`""
+                           -Arguments "//nologo `"$ieFixFile`" `"$iniPath`"" `
+                           -Capture
+    # ALWAYS surface this one. It reports which Edge profiles it touched and whether a
+    # signed-in profile blocked the edit - the difference between "worked" and "silently
+    # did nothing", which the log previously could not distinguish.
+    Write-CapturedOutput -Label "IEModeExpiryFix.vbs report" -Text $script:LastOutput -Colour "Gray"
     if ($code -ne 0) { Add-Warning "Step 4" "IEModeExpiryFix.vbs exited with $code" }
+    if ($script:LastOutput -match 'sign-in detected') {
+        Write-Attention "At least one Edge profile is signed in - IE Mode entries there could not be updated."
+        Add-Warning "Step 4" "An Edge profile is signed in; its IE Mode entries were not updated"
+    }
+    if (-not $script:LastOutput) {
+        Write-Attention "The IE Mode fix produced no output - it may not have found any Edge profile."
+        Add-Warning "Step 4" "IEModeExpiryFix.vbs produced no output (no Edge profile found?)"
+    }
 } else {
     Write-Skip "IEModeExpiryFix.vbs not found in $SourceDir"
     Add-Warning "Step 4" "IEModeExpiryFix.vbs missing from the package"
@@ -743,10 +807,12 @@ if ($regFile) {
     Write-Info "Importing: $($regFile.FullName)"
     $code = Invoke-Tracked -Text "Running reg import (as Administrator)..." `
                            -FilePath "reg.exe" `
-                           -Arguments "import `"$($regFile.FullName)`""
+                           -Arguments "import `"$($regFile.FullName)`"" `
+                           -Capture
     if ($code -eq 0) {
         Write-Ok "Java plug-in pre-approved (64-bit and Wow6432Node views)."
     } else {
+        Write-CapturedOutput -Label "reg output" -Text $script:LastOutput -Colour "Red"
         Add-Failure "Step 6" "reg import of $($regFile.Name) failed (exit $code)"
     }
 } else {
@@ -806,6 +872,8 @@ $summary.Add("Java 8 found  : $(if (Get-Jre8Dir) { Get-Jre8Dir } else { 'NONE' }
 $summary.Add("Reboot needed : $script:RebootRequired")
 $summary.Add("Result        : $(if ($exitCode -eq 0) { 'SUCCESS' } else { "FAILED ($($script:Failures.Count) failure(s))" })")
 $summary.Add("Exit code     : $exitCode")
+# Recorded even if the copy later fails, so the intended destination is always visible
+$summary.Add("Log copy dest : $(if ($LogCopyDir) { $LogCopyDir } else { '(none requested)' })")
 $summary.Add("")
 if ($script:Failures.Count -gt 0) {
     $summary.Add("FAILURES:")
@@ -835,19 +903,34 @@ try { Stop-Transcript | Out-Null } catch { }
 # Copy the logs somewhere the technician will actually look (next to the installer).
 # Deliberately after Stop-Transcript so the transcript is complete and closed.
 if ($LogCopyDir) {
+    # The transcript is already closed, so Write-Host here reaches the console only.
+    # The outcome is therefore APPENDED to the summary file, which is the durable
+    # record - previously there was no way to tell afterwards whether this ran.
+    $copyResult = ""
     try {
         if (-not (Test-Path -LiteralPath $LogCopyDir)) {
             New-Item -ItemType Directory -Force -Path $LogCopyDir -ErrorAction Stop | Out-Null
         }
-        foreach ($f in @($LogFile, $summaryFile)) {
-            if ($f -and (Test-Path -LiteralPath $f)) {
-                Copy-Item -LiteralPath $f -Destination $LogCopyDir -Force -ErrorAction Stop
-            }
+        # Transcript first, then the summary, so the summary carries the final verdict
+        if ($LogFile -and (Test-Path -LiteralPath $LogFile)) {
+            Copy-Item -LiteralPath $LogFile -Destination $LogCopyDir -Force -ErrorAction Stop
         }
+        $copyResult = "Log copy      : OK -> $LogCopyDir"
         Write-Host "Logs copied to: $LogCopyDir" -ForegroundColor Cyan
     } catch {
         # Read-only share, CD, or a full disk - not worth failing the deployment over
+        $copyResult = "Log copy      : FAILED -> $LogCopyDir ($($_.Exception.Message))"
         Write-Host "Could not copy logs to '$LogCopyDir': $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    if ($summaryFile) {
+        try { Add-Content -LiteralPath $summaryFile -Value $copyResult -Encoding ASCII } catch { }
+        # Copy the summary last so the copy at the destination includes the verdict above
+        try {
+            Copy-Item -LiteralPath $summaryFile -Destination $LogCopyDir -Force -ErrorAction Stop
+        } catch {
+            Write-Host "Could not copy the summary to '$LogCopyDir': $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 }
 

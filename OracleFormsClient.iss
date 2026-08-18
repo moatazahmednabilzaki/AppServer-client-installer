@@ -20,7 +20,7 @@
 ; =====================================================================
 
 #define MyAppName      "Oracle Forms 11g Client Setup"
-#define MyAppVersion   "1.0.0"
+#define MyAppVersion   "1.0.1"
 #define MyAppPublisher "National Technology"
 #define MyScript       "1-Automated_Fix.ps1"
 

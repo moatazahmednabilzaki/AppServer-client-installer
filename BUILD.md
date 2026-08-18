@@ -116,9 +116,35 @@ assigns `NL := #13#10;` and concatenates `NL` instead.
 
 - The payload is unpacked into Setup's temp folder and deleted when it exits;
   nothing is permanently installed by the wrapper itself.
-- Expect ~137 MB. Both payload binaries are already compressed, so LZMA2 has little
-  left to squeeze (137.7 MB in, 136.7 MB out). Too large for email — use a download
-  link, share or USB.
+- Expect ~137 MB. Too large for email — use a download link, share or USB.
+
+### Do not bother tuning compression
+
+Measured, not guessed:
+
+| Setting | Output | Compile time |
+|---|---|---|
+| `lzma2/max` (current) | 136.71 MB | 24 s |
+| `lzma2/ultra64` | 136.59 MB | 227 s |
+
+**0.12 MB saved for a 9.4x longer compile.** Both payload binaries are already
+compressed archives (137.7 MB of input becomes ~135.5 MB of compressed data — a 1.6%
+gain), so there is essentially no entropy left for LZMA2 to remove. Keep
+`lzma2/max`.
+
+The only real lever is **what you include**, not how you compress it:
+
+| Contents | Approx. exe size |
+|---|---|
+| JRE + Adobe (current) | 137 MB |
+| JRE only, Adobe shipped separately or fetched | 65 MB |
+
+Worth knowing: Step 5 already **skips** Adobe when any Acrobat or Reader is present,
+so on those machines the 72 MB of Adobe payload is shipped and unpacked for nothing.
+If most target machines already have a PDF reader, splitting Adobe into a second
+optional exe is the biggest available win.
+
+Re-zipping the exe for transport does not help — it is already compressed.
 - **Free disk space on the client:** the exe needs roughly 140 MB to unpack, on top
   of what Java 8 and Adobe Reader themselves consume. Budget ~700 MB free on `C:`.
 - The built exe is **not** committed to git (`dist/` is ignored, and it exceeds
