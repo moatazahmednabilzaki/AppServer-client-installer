@@ -36,7 +36,10 @@ if not exist "%SCRIPT%" (
 :: been removed - Unblock-File alone is enough to clear the zone marker.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath $env:PKGDIR -File | Unblock-File -ErrorAction SilentlyContinue"
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File "%SCRIPT%"
+:: %* forwards any arguments through to the script, so this path supports the same
+:: settings as the installer, e.g.:
+::   Deploy.bat -FormsUrl "https://host/forms/frmservlet?config=LDM" -BranchCode 123
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File "%SCRIPT%" %*
 set "RC=%errorlevel%"
 
 if not "%RC%"=="0" (

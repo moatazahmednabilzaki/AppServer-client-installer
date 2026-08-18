@@ -1,6 +1,6 @@
 # Building the single-EXE installer
 
-Produces one self-contained `OracleForms11g_Client_Setup_1.0.0.exe` (~135–140 MB)
+Produces one self-contained `OracleForms11g_Client_Setup_1.1.0.exe` (~137 MB)
 for sending to customers.
 
 ## Prerequisites
@@ -47,10 +47,40 @@ Output lands in `dist\`.
 
 | Command | Behaviour |
 |---|---|
-| Double-click the exe | UAC prompt, wizard, visible console showing all 6 steps, summary at the end |
+| Double-click the exe | UAC prompt, settings page, then a visible console showing all 8 steps |
 | `Setup.exe /SILENT` | Progress window only, no prompts, console hidden |
 | `Setup.exe /VERYSILENT` | Completely unattended — for SCCM / Intune / GPO |
 | `Setup.exe /LOG="C:\path\inno.log"` | Also write Inno's own extraction log |
+
+### Settings page (first page of the wizard)
+
+Three fields. The URL is required; the two codes are optional and, when left blank,
+the registry is not touched at all.
+
+| Field | Switch | Effect |
+|---|---|---|
+| Application URL | `/URL=` | Drives **every** step: Edge IE Mode site list, Trusted Sites zone, Java exception list, the VBS launcher and the LDM shortcut |
+| Branch location code | `/BRANCH=` | REG_SZ `branch_code` under `HKLM\SOFTWARE\WOW6432Node\branch_code` |
+| Lab location code | `/LAB=` | REG_SZ `lab_location` under `HKLM\SOFTWARE\WOW6432Node\lab_location` |
+
+Unattended example:
+
+```bash
+OracleForms11g_Client_Setup_1.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /URL="https://100.74.53.100/forms/frmservlet?config=LDM" /BRANCH=00123 /LAB=987
+```
+
+Notes:
+
+- Codes must be **ASCII digits only**. Arabic-Indic numerals are rejected on purpose —
+  they would otherwise be stored as a "numeric" code nothing downstream can parse.
+  Leading zeros are preserved (`00123` stays `00123`), since the value is a REG_SZ.
+- Existing values are **updated**, not duplicated. The script reads the value back
+  after writing and logs the before/after.
+- Invalid input in silent mode **does not deploy anything**. Setup exits with the code
+  below and writes `SETUP_INPUT_ERROR.txt` next to the exe explaining why, because the
+  deployment script never runs and so never produces a log.
+- A URL with a port works: `https://host:8443/...` keeps the port in the site list and
+  the Java exception list, while the Trusted Sites zone entry gets the bare host.
 
 The exe **self-elevates**, so there is no need to tell customers to right-click and
 Run as administrator.
@@ -69,8 +99,14 @@ Run as administrator.
 | 0 | Success |
 | 1 | Deployment ran but one or more steps failed |
 | 5 | Not elevated (UAC declined) |
+| 6 | The URL reached the script but was unusable |
+| **10** | Setup rejected the URL — nothing was deployed |
+| **11** | Setup rejected a location code — nothing was deployed |
 | 99 | PowerShell could not be launched |
-| 2, 3, 4… | Inno Setup's own codes (cancelled, init failure) — see Inno docs |
+| 2, 3, 4, 7, 8 | Inno Setup's own codes (cancelled, init failure, aborted) — see Inno docs |
+
+10 and 11 sit deliberately above Inno's own 0–8 range so "bad input" can never be
+confused with Inno's 5 = cancelled, 6 = terminated or 7 = aborted while preparing.
 
 ## Logs
 
@@ -154,7 +190,8 @@ Re-zipping the exe for transport does not help — it is already compressed.
   Java, writes HKLM policy, imports root certificates and re-enables MD5 and
   TLS 1.0. A signed build with an OV certificate largely avoids this; EV gets
   SmartScreen reputation immediately.
-- To retarget a different customer, edit only the CONFIG block at the top of
-  `1-Automated_Fix.ps1` (`$ServerHost`, `$FormsConfig`) and **bump `$SiteListVer`** —
-  Edge caches the IE Mode site list by version number and will otherwise keep serving
-  the old one.
+- **Retargeting a customer no longer needs a code edit.** Type the URL on the settings
+  page, or pass `/URL=`. The old manual `$SiteListVer` bump is gone too: the script now
+  reads the site list already on the machine and increments past it automatically
+  whenever the target host changes, which is what Edge's version-based caching requires.
+  Change `#define DefaultUrl` in the .iss only if you want a different pre-filled value.

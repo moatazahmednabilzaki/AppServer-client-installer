@@ -9,13 +9,27 @@
       4. Apply Edge IE Mode + Java Control Panel policy
       5. Install Adobe Reader XI silently
       6. Pre-approve the Java browser plug-in (java-plugin-preapprove.reg)
+      7. Record the optional branch / lab location codes in the registry
+      8. Create the 'LDM' Edge shortcut on the public desktop
 
     Run via Deploy.bat (which enforces elevation). Requires Administrator.
     A full log is written to C:\ProgramData\AppServerClientInstaller\Logs.
 
-    Exit codes: 0 = success, 1 = one or more steps failed, 5 = not elevated.
+    Exit codes: 0 = success, 1 = one or more steps failed, 5 = not elevated,
+                6 = the -FormsUrl value is not a usable URL.
 #>
 param(
+    # MANDATORY in effect - the full application URL. Drives EVERY step: the Edge IE
+    # Mode site list, the Trusted Sites zone entry, the Java exception site list and
+    # both desktop launchers. The default is the previously hardcoded value, so
+    # Deploy.bat keeps working with no arguments.
+    [string] $FormsUrl = "https://100.74.53.100/forms/frmservlet?config=LDM",
+
+    # Optional numeric location codes. Blank means "leave the registry untouched".
+    # Written as REG_SZ under HKLM\SOFTWARE\WOW6432Node\{branch_code,lab_location}.
+    [string] $BranchCode = "",
+    [string] $LabCode    = "",
+
     # Unattended mode: no spinner animation, no "press any key" at the end.
     # Set automatically by the installer when it runs /SILENT or /VERYSILENT.
     [switch] $Silent,
@@ -33,10 +47,10 @@ try { $Host.UI.RawUI.WindowTitle = "Oracle Forms 11g - Automated Deployment" } c
 # =====================================================================
 #  CONFIGURATION - this is the only block you should need to edit
 # =====================================================================
-$ServerHost   = "100.74.53.100"   # Forms server (must match the leaf cert CN)
-$FormsConfig  = "LDM"             # the frmservlet ?config= value
-$SiteListVer  = 2                 # !! BUMP THIS whenever the IE Mode site list
-                                  #    below changes, or Edge keeps its cached copy
+# The server is NO LONGER hardcoded here - it is derived from -FormsUrl below, so one
+# parameter drives every step. Pass -FormsUrl to retarget a different customer.
+$SiteListVerMin = 3               # floor for the IE Mode site list version; the real
+                                  # version auto-increments when the site changes
 $MinJreUpdate = 241               # reinstall if the installed 8uNNN is older than this
 $FallbackDir  = "C:\Java_8_upgrade"   # legacy staging path, still searched
 $LogDir       = Join-Path $env:ProgramData "AppServerClientInstaller\Logs"
@@ -57,8 +71,35 @@ $StageFromUnc = $true             # copy the package locally first when run from
 $TlsReEnable  = @('TLSv1', 'TLSv1.1', 'TLS_RSA_*', '3DES_EDE_CBC')
 # =====================================================================
 
-$SiteUrl  = "https://$ServerHost"
-$FormsUrl = "https://$ServerHost/forms/frmservlet?config=$FormsConfig"
+# ---------------------------------------------------------------------
+#  Everything below is derived from -FormsUrl. $ServerAuthority keeps the port when
+#  one is specified (the IE Mode site list and Java exception sites need it), while
+#  $ServerHost is the bare host, which is what the Trusted Sites zone range expects.
+# ---------------------------------------------------------------------
+$FormsUrl = $FormsUrl.Trim()
+$UrlError = ""
+$uri = $null
+try { $uri = [uri]$FormsUrl } catch { $uri = $null }
+
+if (-not $uri -or -not $uri.IsAbsoluteUri) {
+    $UrlError = "'$FormsUrl' is not a valid absolute URL."
+} elseif (@('http', 'https') -notcontains $uri.Scheme) {
+    $UrlError = "URL scheme must be http or https, got '$($uri.Scheme)'."
+} elseif (-not $uri.Host) {
+    $UrlError = "URL '$FormsUrl' has no host."
+}
+
+if ($UrlError) {
+    # Fall back to sane values so the script can still start up and report the error
+    $ServerHost = ""; $ServerAuthority = ""; $SiteUrl = ""; $FormsConfig = ""
+} else {
+    $ServerHost      = $uri.Host
+    $ServerAuthority = $uri.Authority                                  # host[:port]
+    $SiteUrl         = "{0}://{1}" -f $uri.Scheme, $uri.Authority
+    $FormsConfig     = ""
+    $cfgMatch = [regex]::Match($uri.Query, '(?i)(?:^\?|&)config=([^&]*)')
+    if ($cfgMatch.Success) { $FormsConfig = $cfgMatch.Groups[1].Value }
+}
 
 # Where this package actually lives. Previously the installer and certificate
 # paths were hardcoded to C:\Java_8_upgrade, so running the package from a USB
@@ -260,6 +301,99 @@ function Get-Jre8Dir {
     return $null
 }
 
+# Writes a REG_SZ under HKLM using an explicit 64-bit registry view.
+#
+# Why the explicit view: the installer launches the 32-bit PowerShell (verified -
+# Inno's {sys} resolves to SysWOW64), and a 32-bit process has HKLM\SOFTWARE
+# redirected to HKLM\SOFTWARE\WOW6432Node. Testing showed Windows does NOT
+# re-redirect a path that already names WOW6432Node, so the naive write would in fact
+# land correctly - but pinning Registry64 makes the destination unambiguous no matter
+# which PowerShell runs this, and keeps working if the path is ever changed to one
+# that IS subject to redirection.
+function Set-Hklm64String {
+    param(
+        [string] $SubKey,      # e.g. SOFTWARE\WOW6432Node\branch_code
+        [string] $ValueName,
+        [string] $Data
+    )
+    $base = $null
+    $key  = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                    [Microsoft.Win32.RegistryHive]::LocalMachine,
+                    [Microsoft.Win32.RegistryView]::Registry64)
+        # CreateSubKey both creates and opens-for-write, so it covers the
+        # "add it" and "update the existing value" cases identically.
+        $key = $base.CreateSubKey($SubKey)
+        if (-not $key) { throw "CreateSubKey returned nothing for '$SubKey'" }
+        $key.SetValue($ValueName, $Data, [Microsoft.Win32.RegistryValueKind]::String)
+        return $true
+    } catch {
+        Write-Bad "Registry write failed for HKLM\$SubKey : $($_.Exception.Message)"
+        return $false
+    } finally {
+        if ($key)  { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+}
+
+# Reads back a REG_SZ from the 64-bit view, so the log can prove what actually landed
+function Get-Hklm64String {
+    param([string]$SubKey, [string]$ValueName)
+    $base = $null; $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                    [Microsoft.Win32.RegistryHive]::LocalMachine,
+                    [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey($SubKey)
+        if (-not $key) { return $null }
+        return [string]$key.GetValue($ValueName, $null)
+    } catch {
+        return $null
+    } finally {
+        if ($key)  { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+}
+
+# Locates msedge.exe: App Paths is authoritative, then the conventional install dirs
+function Get-EdgePath {
+    $base = $null; $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                    [Microsoft.Win32.RegistryHive]::LocalMachine,
+                    [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe')
+        if ($key) {
+            $p = [string]$key.GetValue('', $null)
+            if ($p) {
+                $p = $p.Trim().Trim('"')
+                if (Test-Path -LiteralPath $p) { return $p }
+            }
+        }
+    } catch {
+    } finally {
+        if ($key)  { $key.Close() }
+        if ($base) { $base.Close() }
+    }
+    foreach ($c in @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+                     "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe")) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    return $null
+}
+
+# True only for a non-empty string of ASCII digits.
+# [0-9] deliberately, NOT \d: in .NET \d matches every Unicode decimal digit, so
+# Arabic-Indic numerals (U+0660..U+0669) would pass and then be written to the registry
+# as a "numeric" code that nothing downstream can parse. Verified: '\d' accepted them,
+# '[0-9]' rejects them. Mirrors the installer's Pascal-side check, which is ASCII too.
+function Test-DigitsOnly {
+    param([string]$Value)
+    if (-not $Value) { return $false }
+    return ($Value -match '^[0-9]+$')
+}
+
 # Removes tokens from a comma-separated java.security property, following the
 # backslash line-continuations that these properties are wrapped across, and rewrites
 # the whole property as a single line. Returns the new line array plus what changed.
@@ -324,7 +458,10 @@ try {
 Write-Host "=======================================================" -ForegroundColor Cyan
 Write-Host "     Oracle Forms 11g - Enterprise Deployment Script   " -ForegroundColor Cyan
 Write-Host "=======================================================" -ForegroundColor Cyan
-Write-Host "  Server   : $ServerHost (config=$FormsConfig)"
+Write-Host "  URL      : $FormsUrl"
+Write-Host "  Server   : $ServerAuthority$(if ($FormsConfig) { " (config=$FormsConfig)" })"
+Write-Host "  Branch   : $(if ($BranchCode) { $BranchCode } else { '(not supplied)' })"
+Write-Host "  Lab      : $(if ($LabCode)    { $LabCode }    else { '(not supplied)' })"
 Write-Host "  Package  : $SourceDir"
 if ($LogFile) { Write-Host "  Log      : $LogFile" }
 else          { Write-Host "  Log      : (could not be created)" -ForegroundColor Yellow }
@@ -350,6 +487,22 @@ if (-not $isAdmin) {
         try { $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null } catch { }
     }
     exit 5
+}
+
+# ---------------------------------------------------------------------
+#  The URL drives every step, so an invalid one must stop here rather than half
+#  configure the machine against a broken address.
+# ---------------------------------------------------------------------
+if ($UrlError) {
+    Write-Host "ERROR: $UrlError" -ForegroundColor Red
+    Write-Host "       Pass a full URL, e.g. -FormsUrl ""https://host/forms/frmservlet?config=LDM""" -ForegroundColor Red
+    try { Stop-Transcript | Out-Null } catch { }
+    if ($Interactive) {
+        Write-Host ""
+        Write-Host "Press any key to exit..."
+        try { $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null } catch { }
+    }
+    exit 6
 }
 
 # ---------------------------------------------------------------------
@@ -583,9 +736,35 @@ reg add "HKLM\SOFTWARE\Policies\Microsoft\Edge" /v InternetExplorerIntegrationRe
 $sysDeployDir = "C:\Windows\Sun\Java\Deployment"
 if (!(Test-Path $sysDeployDir)) { New-Item -ItemType Directory -Force -Path $sysDeployDir | Out-Null }
 $siteListXml = "$sysDeployDir\edge_iemode_list.xml"
+
+# Edge caches the Enterprise Mode site list BY VERSION NUMBER: if the file changes but
+# the version does not increase, machines that already read an older copy keep using it.
+# Now that the URL is user-supplied this cannot be a hand-maintained constant, so the
+# version is derived - bumped past whatever is already on disk whenever the site
+# actually differs, and left alone when it does not.
+$SiteListVer = $SiteListVerMin
+if (Test-Path -LiteralPath $siteListXml) {
+    $oldXml = ""
+    try { $oldXml = [System.IO.File]::ReadAllText($siteListXml) } catch { }
+    $oldVer  = 0
+    $oldSite = ""
+    $m = [regex]::Match($oldXml, 'version="(\d+)"')
+    if ($m.Success) { $oldVer = [int]$m.Groups[1].Value }
+    $m = [regex]::Match($oldXml, '<site\s+url="([^"]*)"')
+    if ($m.Success) { $oldSite = $m.Groups[1].Value }
+
+    if ($oldSite -ieq $ServerAuthority) {
+        $SiteListVer = [Math]::Max($oldVer, $SiteListVerMin)
+        Write-Info "IE Mode site list already targets $ServerAuthority (version $SiteListVer)."
+    } else {
+        $SiteListVer = [Math]::Max($oldVer + 1, $SiteListVerMin)
+        Write-Info "IE Mode site list changing '$oldSite' -> '$ServerAuthority', version $oldVer -> $SiteListVer."
+    }
+}
+
 $xmlContent = @"
 <site-list version="$SiteListVer">
-  <site url="$ServerHost">
+  <site url="$ServerAuthority">
     <compat-mode>Default</compat-mode>
     <open-in>IE11</open-in>
   </site>
@@ -822,6 +1001,103 @@ if ($regFile) {
 }
 
 # =====================================================================
+# STEP 7: Location codes (optional)
+# =====================================================================
+Write-StepTitle "[Step 7] Recording location codes..."
+
+# Key path, value name and value data all use the same identifier, per spec:
+#   HKLM\SOFTWARE\WOW6432Node\branch_code   value "branch_code"   = <digits>
+#   HKLM\SOFTWARE\WOW6432Node\lab_location  value "lab_location"  = <digits>
+$codeTargets = @(
+    @{ Label = "Branch location code"; Value = $BranchCode; Key = "SOFTWARE\WOW6432Node\branch_code";  Name = "branch_code"  },
+    @{ Label = "Lab location code";    Value = $LabCode;    Key = "SOFTWARE\WOW6432Node\lab_location"; Name = "lab_location" }
+)
+
+$anyCode = $false
+foreach ($t in $codeTargets) {
+    if (-not $t.Value) { continue }
+    $anyCode = $true
+
+    if (-not (Test-DigitsOnly $t.Value)) {
+        Write-Bad "$($t.Label) '$($t.Value)' is not digits only - registry NOT written."
+        Add-Failure "Step 7" "$($t.Label) '$($t.Value)' is not numeric; $($t.Name) was not written"
+        continue
+    }
+
+    $existing = Get-Hklm64String -SubKey $t.Key -ValueName $t.Name
+    if (Set-Hklm64String -SubKey $t.Key -ValueName $t.Name -Data $t.Value) {
+        # Read back rather than trust the write, so the log records what actually landed
+        $now = Get-Hklm64String -SubKey $t.Key -ValueName $t.Name
+        if ($now -eq $t.Value) {
+            if ($null -eq $existing) {
+                Write-Ok "$($t.Label): created HKLM\$($t.Key) -> $($t.Name) = $now"
+            } elseif ($existing -eq $t.Value) {
+                Write-Ok "$($t.Label): already $now, unchanged."
+            } else {
+                Write-Ok "$($t.Label): updated $($t.Name) from '$existing' to '$now'"
+            }
+        } else {
+            Write-Bad "$($t.Label): wrote '$($t.Value)' but read back '$now'"
+            Add-Failure "Step 7" "$($t.Name) read back as '$now' instead of '$($t.Value)'"
+        }
+    } else {
+        Add-Failure "Step 7" "Could not write $($t.Name) to HKLM\$($t.Key)"
+    }
+}
+
+if (-not $anyCode) {
+    Write-Skip "No branch or lab code supplied - registry left unchanged."
+}
+
+# =====================================================================
+# STEP 8: Desktop shortcut  (runs last, after everything is configured)
+# =====================================================================
+Write-StepTitle "[Step 8] Creating the 'LDM' Edge shortcut on the desktop..."
+
+$edgeExe = Get-EdgePath
+if (-not $edgeExe) {
+    Write-Bad "msedge.exe not found - the LDM shortcut was not created."
+    Add-Failure "Step 8" "Microsoft Edge not found; LDM desktop shortcut not created"
+} else {
+    Write-Info "Edge: $edgeExe"
+    # Public Desktop so every user of the machine gets it, matching the existing launcher
+    $desktopDir = Join-Path $env:PUBLIC "Desktop"
+    $lnkPath    = Join-Path $desktopDir "LDM.lnk"
+    $shell      = $null
+    try {
+        if (-not (Test-Path -LiteralPath $desktopDir)) {
+            New-Item -ItemType Directory -Force -Path $desktopDir -ErrorAction Stop | Out-Null
+        }
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($lnkPath)
+        $sc.TargetPath       = $edgeExe
+        # Quoted so a URL containing a space or & cannot be split by the shell.
+        # No IE Mode switch is needed: the Enterprise Mode site list written in Step 4
+        # makes Edge open this address in IE Mode automatically.
+        $sc.Arguments        = '"' + $FormsUrl + '"'
+        $sc.WorkingDirectory = Split-Path -Parent $edgeExe
+        $sc.IconLocation     = "$edgeExe,0"
+        $sc.Description      = "Oracle Forms 11g - LDM"
+        $sc.Save()
+
+        if (Test-Path -LiteralPath $lnkPath) {
+            Write-Ok "Created: $lnkPath"
+            Write-Info "Opens: $FormsUrl"
+        } else {
+            Write-Bad "Save() reported no error but $lnkPath does not exist."
+            Add-Failure "Step 8" "LDM shortcut was not created at $lnkPath"
+        }
+    } catch {
+        Write-Bad "Could not create the LDM shortcut: $($_.Exception.Message)"
+        Add-Failure "Step 8" "LDM desktop shortcut failed: $($_.Exception.Message)"
+    } finally {
+        if ($shell) {
+            try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null } catch { }
+        }
+    }
+}
+
+# =====================================================================
 #  Result
 # =====================================================================
 Write-Host ""
@@ -865,7 +1141,11 @@ $summary.Add("===================================================")
 $summary.Add("Computer      : $env:COMPUTERNAME")
 $summary.Add("User          : $env:USERDOMAIN\$env:USERNAME")
 $summary.Add("Date          : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-$summary.Add("Server        : $ServerHost (config=$FormsConfig)")
+$summary.Add("URL           : $FormsUrl")
+$summary.Add("Server        : $ServerAuthority$(if ($FormsConfig) { " (config=$FormsConfig)" })")
+$summary.Add("Branch code   : $(if ($BranchCode) { "$BranchCode -> $(Get-Hklm64String -SubKey 'SOFTWARE\WOW6432Node\branch_code'  -ValueName 'branch_code')"  } else { '(not supplied)' })")
+$summary.Add("Lab code      : $(if ($LabCode)    { "$LabCode -> $(Get-Hklm64String -SubKey 'SOFTWARE\WOW6432Node\lab_location' -ValueName 'lab_location')" } else { '(not supplied)' })")
+$summary.Add("LDM shortcut  : $(if (Test-Path -LiteralPath (Join-Path $env:PUBLIC 'Desktop\LDM.lnk')) { 'created' } else { 'MISSING' })")
 $summary.Add("Package       : $SourceDir")
 $summary.Add("Silent mode   : $([bool]$Silent)")
 $summary.Add("Java 8 found  : $(if (Get-Jre8Dir) { Get-Jre8Dir } else { 'NONE' })")
