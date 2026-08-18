@@ -117,7 +117,12 @@ var
   RC: Integer;
   ShowMode: Integer;
   SummaryPath: String;
+  NL: String;
 begin
+  { Held in a variable because the ISPP preprocessor treats a line that STARTS with
+    '#' as a preprocessor directive - a wrapped line beginning #13#10 fails to compile. }
+  NL := #13#10;
+
   if CurStep <> ssPostInstall then
     Exit;
 
@@ -149,8 +154,8 @@ begin
                    ExpandConstant('{computername}') + '.txt';
     SuppressibleMsgBox(
       'Deployment finished with problems (exit code ' + IntToStr(DeployExitCode) + ').' +
-      #13#10#13#10 + 'A short summary was written to:' + #13#10 + SummaryPath +
-      #13#10#13#10 + 'Please send that file to support.',
+      NL + NL + 'A short summary was written to:' + NL + SummaryPath +
+      NL + NL + 'Please send that file to support.',
       mbError, MB_OK, IDOK);
   end;
 end;

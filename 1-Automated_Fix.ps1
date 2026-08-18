@@ -293,7 +293,8 @@ try {
 } catch { }
 if (-not $isAdmin) {
     Write-Host "ERROR: This script must be run as Administrator." -ForegroundColor Red
-    Write-Host "       Right-click Deploy.bat and choose 'Run as administrator'." -ForegroundColor Red
+    Write-Host "       - launched from the Setup .exe: approve the elevation prompt." -ForegroundColor Red
+    Write-Host "       - launched from Deploy.bat: right-click it, 'Run as administrator'." -ForegroundColor Red
     try { Stop-Transcript | Out-Null } catch { }
     if ($Interactive) {
         Write-Host ""

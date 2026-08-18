@@ -55,6 +55,13 @@ Output lands in `dist\`.
 The exe **self-elevates**, so there is no need to tell customers to right-click and
 Run as administrator.
 
+> **On the embedded manifest.** The compiled exe's manifest says
+> `requestedExecutionLevel level="asInvoker"`, not `requireAdministrator`. This is
+> correct and expected: Inno Setup performs elevation at *runtime* (it re-launches
+> itself with the `runas` verb) rather than through the manifest. Verified by
+> extracting the manifest from Inno Setup's **own** installer, which unquestionably
+> requires admin and is likewise `asInvoker`. Do not "fix" this.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -76,12 +83,46 @@ Three places, in decreasing order of usefulness for support:
 3. `%ProgramData%\AppServerClientInstaller\Logs\deploy_<COMPUTERNAME>_<timestamp>.log`
    — full transcript of every step.
 
+## Verified build
+
+Built and tested with Inno Setup 6.7.3:
+
+| Check | Result |
+|---|---|
+| Compile | Success, ~24–90 s (first build is slowest) |
+| Output size | 136.7 MB from a 137.7 MB payload |
+| Payload extraction | Unpacks to `%TEMP%\is-XXXXXXXX.tmp`, script runs from there |
+| Temp cleanup | No `is-*.tmp` folder left behind |
+| `/VERYSILENT` | `-Silent` correctly passed to the script |
+| `-LogCopyDir` quoting | Survives a launch folder named `Launch Folder With Spaces (x86) & more` |
+| Exit code passthrough | Script exit code surfaces as Setup's exit code (verified with a script returning 42) |
+
+The end-to-end run was done with `PrivilegesRequired=lowest` so the deployment
+script's own elevation guard aborted it at exit 5 — this exercised extraction,
+argument passing and exit-code capture without altering the build machine.
+
+**Not yet verified on a real client:** the UAC prompt itself, and the six deployment
+steps actually running to completion. Do that once on a test client before any
+fleet rollout.
+
+### Gotcha if you edit the .iss
+
+The ISPP preprocessor treats a line whose first non-whitespace character is `#` as a
+preprocessor directive. A wrapped Pascal string starting with `#13#10` fails to
+compile with *"Unknown preprocessor directive"*. That is why the `[Code]` section
+assigns `NL := #13#10;` and concatenates `NL` instead.
+
 ## Notes
 
 - The payload is unpacked into Setup's temp folder and deleted when it exits;
   nothing is permanently installed by the wrapper itself.
-- Expect ~135–140 MB. Both payload binaries are already compressed, so LZMA2 has
-  little left to squeeze. Too large for email — use a download link, share or USB.
+- Expect ~137 MB. Both payload binaries are already compressed, so LZMA2 has little
+  left to squeeze (137.7 MB in, 136.7 MB out). Too large for email — use a download
+  link, share or USB.
+- **Free disk space on the client:** the exe needs roughly 140 MB to unpack, on top
+  of what Java 8 and Adobe Reader themselves consume. Budget ~700 MB free on `C:`.
+- The built exe is **not** committed to git (`dist/` is ignored, and it exceeds
+  GitHub's 100 MB file limit). Build it from source when you need it.
 - **Unsigned builds will trigger SmartScreen** ("Windows protected your PC") and
   may be quarantined by AV. That is expected for an unsigned binary that uninstalls
   Java, writes HKLM policy, imports root certificates and re-enables MD5 and
