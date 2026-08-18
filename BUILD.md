@@ -119,6 +119,19 @@ Three places, in decreasing order of usefulness for support:
 3. `%ProgramData%\AppServerClientInstaller\Logs\deploy_<COMPUTERNAME>_<timestamp>.log`
    — full transcript of every step.
 
+## Release status
+
+| Version | Status |
+|---|---|
+| **v1.1.0** | **Confirmed working on a client by the user, 2026-08-18.** Reported stable and successful. This supersedes the "not clicked through by a human" caveat recorded in the v1.1.0 git tag message, which was written before that confirmation. |
+| v1.0.1 | Superseded. Confirmed working on WIN-0RUCE62NOTH (Server 2022): all steps, exit 0, 99 s. |
+
+Still not exercised by any run so far, on any version: the **Java 5 / 6 removal path**.
+Every machine tested has been clean, so the `msiexec` / WMI uninstall branch in Step 1
+has never actually executed. It remains the least proven code in the package, and a
+confirmation of a normal deployment does not cover it — that needs a client that
+genuinely has old Java installed.
+
 ## Verified build
 
 Built and tested with Inno Setup 6.7.3:
