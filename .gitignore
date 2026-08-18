@@ -10,3 +10,7 @@ deploy_*.log
 
 # Claude Code local session config (machine-specific)
 .claude/settings.local.json
+
+# Adobe Reader installer binary (72 MB) - not tracked in git.
+# Must be placed alongside Deploy.bat before deployment, or Step 5 fails.
+AdbeRdr*.exe
