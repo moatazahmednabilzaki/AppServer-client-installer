@@ -28,6 +28,21 @@ $SiteListVer  = 2                 # !! BUMP THIS whenever the IE Mode site list
 $MinJreUpdate = 241               # reinstall if the installed 8uNNN is older than this
 $FallbackDir  = "C:\Java_8_upgrade"   # legacy staging path, still searched
 $LogDir       = Join-Path $env:ProgramData "AppServerClientInstaller\Logs"
+$StageFromUnc = $true             # copy the package locally first when run from a share
+
+# Legacy TLS. Oracle Forms 11g / OHS 11g typically only offers TLS 1.0 with RSA key
+# exchange. Java 8u291 and later refuse that by default via jdk.tls.disabledAlgorithms
+# in java.security, and deployment.security.TLSv1=true CANNOT override it - the tokens
+# have to physically come out of java.security. These are removed:
+#
+#   TLSv1, TLSv1.1  - the protocols themselves
+#   TLS_RSA_*       - RSA key-exchange suites (e.g. TLS_RSA_WITH_AES_128_CBC_SHA)
+#   3DES_EDE_CBC    - 3DES suites, still the only option on some old servers
+#
+# WARNING: this weakens TLS for EVERY Java application on the machine, not just
+# Oracle Forms. Trim this list to the minimum your server actually needs. SSLv3 and
+# RC4 are deliberately left disabled - do not add them without a very good reason.
+$TlsReEnable  = @('TLSv1', 'TLSv1.1', 'TLS_RSA_*', '3DES_EDE_CBC')
 # =====================================================================
 
 $SiteUrl  = "https://$ServerHost"
@@ -39,11 +54,11 @@ $FormsUrl = "https://$ServerHost/forms/frmservlet?config=$FormsConfig"
 $SourceDir = $PSScriptRoot
 if (-not $SourceDir) { $SourceDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if (-not $SourceDir) { $SourceDir = (Get-Location).Path }
+$SourceDir = $SourceDir.TrimEnd('\')
 
+# $SearchDirs is built after the banner, because $SourceDir can still change if the
+# package needs staging off a network share.
 $SearchDirs = @($SourceDir)
-if ((Test-Path $FallbackDir) -and ($FallbackDir.TrimEnd('\') -ine $SourceDir.TrimEnd('\'))) {
-    $SearchDirs += $FallbackDir
-}
 
 $JavaRootDir = ${env:ProgramFiles(x86)}
 if (-not $JavaRootDir) { $JavaRootDir = $env:ProgramFiles }
@@ -159,7 +174,8 @@ function Find-PackageFiles {
     $found = @()
     $seen  = @{}
     foreach ($dir in $SearchDirs) {
-        foreach ($f in @(Get-ChildItem -Path $dir -Filter $Pattern -File -ErrorAction SilentlyContinue)) {
+        # -LiteralPath: the folder name is data, so [ ] in a path must not glob
+        foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter $Pattern -File -ErrorAction SilentlyContinue)) {
             if (-not $seen.ContainsKey($f.Name)) {
                 $seen[$f.Name] = $true
                 $found += $f
@@ -173,13 +189,61 @@ function Find-PackageFiles {
 # LastWriteTime, so with two JREs present it could pick the older one and then patch
 # the wrong java.security file.
 function Get-Jre8Dir {
-    if (-not (Test-Path $JavaRootDir)) { return $null }
-    $dir = Get-ChildItem -Path $JavaRootDir -Filter "jre1.8.0*" -Directory -ErrorAction SilentlyContinue |
-           Where-Object { Test-Path (Join-Path $_.FullName 'bin\java.exe') } |
+    if (-not (Test-Path -LiteralPath $JavaRootDir)) { return $null }
+    $dir = Get-ChildItem -LiteralPath $JavaRootDir -Filter "jre1.8.0*" -Directory -ErrorAction SilentlyContinue |
+           Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin\java.exe') } |
            Sort-Object { Get-JavaUpdateNumber $_.Name } -Descending |
            Select-Object -First 1
     if ($dir) { return $dir.FullName }
     return $null
+}
+
+# Removes tokens from a comma-separated java.security property, following the
+# backslash line-continuations that these properties are wrapped across, and rewrites
+# the whole property as a single line. Returns the new line array plus what changed.
+# Idempotent: removing an already-absent token is a no-op.
+function Edit-SecurityListProperty {
+    param(
+        [string[]] $Lines,
+        [string]   $Property,
+        [string[]] $RemoveTokens
+    )
+    $startIdx = -1
+    $rx = "^\s*" + [regex]::Escape($Property) + "\s*="
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -match $rx) { $startIdx = $i; break }
+    }
+    if ($startIdx -lt 0) {
+        return @{ Lines = $Lines; Found = $false; Removed = @(); Kept = @() }
+    }
+
+    # Walk the continuations to assemble the full logical value
+    $endIdx = $startIdx
+    $parts  = @()
+    $first  = $Lines[$startIdx]
+    $parts += $first.Substring($first.IndexOf('=') + 1)
+    while ($Lines[$endIdx].TrimEnd().EndsWith('\')) {
+        $endIdx++
+        if ($endIdx -ge $Lines.Count) { $endIdx = $Lines.Count - 1; break }
+        $parts += $Lines[$endIdx]
+    }
+    $parts = $parts | ForEach-Object { $_.TrimEnd().TrimEnd('\').Trim() }
+    $flat  = ($parts -join ' ')
+
+    $keep = @(); $removed = @()
+    foreach ($t in ($flat -split ',')) {
+        $tok = $t.Trim()
+        if (-not $tok) { continue }
+        # -contains is case-insensitive for strings, and does NOT treat * as a wildcard
+        if ($RemoveTokens -contains $tok) { $removed += $tok } else { $keep += $tok }
+    }
+
+    $out = @()
+    if ($startIdx -gt 0) { $out += $Lines[0..($startIdx - 1)] }
+    $out += ($Property + "=" + ($keep -join ', '))
+    if (($endIdx + 1) -lt $Lines.Count) { $out += $Lines[($endIdx + 1)..($Lines.Count - 1)] }
+
+    return @{ Lines = $out; Found = $true; Removed = $removed; Kept = $keep }
 }
 
 # ---------------------------------------------------------------------
@@ -202,6 +266,56 @@ Write-Host "  Server   : $ServerHost (config=$FormsConfig)"
 Write-Host "  Package  : $SourceDir"
 if ($LogFile) { Write-Host "  Log      : $LogFile" }
 else          { Write-Host "  Log      : (could not be created)" -ForegroundColor Yellow }
+Write-Host ""
+
+# ---------------------------------------------------------------------
+#  Elevation. Deploy.bat already gates on this, but the script can also be
+#  launched directly - failing 13 steps in a row is a terrible way to find out.
+# ---------------------------------------------------------------------
+$isAdmin = $false
+try {
+    $wp = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $isAdmin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { }
+if (-not $isAdmin) {
+    Write-Host "ERROR: This script must be run as Administrator." -ForegroundColor Red
+    Write-Host "       Right-click Deploy.bat and choose 'Run as administrator'." -ForegroundColor Red
+    try { Stop-Transcript | Out-Null } catch { }
+    if ($Interactive) {
+        Write-Host ""
+        Write-Host "Press any key to exit..."
+        try { $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null } catch { }
+    }
+    exit 5
+}
+
+# ---------------------------------------------------------------------
+#  Package location. The script runs from wherever it happens to live; running
+#  installers straight off a UNC share is unreliable (zone blocking, slow reads),
+#  so stage locally in that one case. Local paths, USB included, run in place.
+# ---------------------------------------------------------------------
+if ($StageFromUnc -and $SourceDir.StartsWith('\\')) {
+    $stageDir = Join-Path $env:TEMP "AppServerClientInstaller_stage"
+    Write-Info "Package is on a network share. Staging locally to $stageDir"
+    try {
+        if (-not (Test-Path -LiteralPath $stageDir)) {
+            New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+        }
+        Get-ChildItem -LiteralPath $SourceDir -File -ErrorAction Stop |
+            Copy-Item -Destination $stageDir -Force -ErrorAction Stop
+        $SourceDir = $stageDir.TrimEnd('\')
+        Write-Ok "Staged locally, running from $SourceDir"
+    } catch {
+        Write-Attention "Local staging failed, continuing from the share: $($_.Exception.Message)"
+        Add-Warning "Setup" "UNC staging failed - ran directly from the network share"
+    }
+}
+
+$SearchDirs = @($SourceDir)
+if ((Test-Path -LiteralPath $FallbackDir) -and ($FallbackDir.TrimEnd('\') -ine $SourceDir.TrimEnd('\'))) {
+    $SearchDirs += $FallbackDir.TrimEnd('\')
+}
+Write-Host "  Searching: $($SearchDirs -join '  |  ')"
 Write-Host ""
 
 # =====================================================================
@@ -359,7 +473,7 @@ Write-StepTitle "[Step 3] Installing SSL Certificates to Trusted Root..."
 $certs = @()
 $seenCerts = @{}
 foreach ($dir in $SearchDirs) {
-    foreach ($f in @(Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
                      Where-Object { $_.Extension -match "^\.(cer|crt|der|pem)$" })) {
         if (-not $seenCerts.ContainsKey($f.Name)) {
             $seenCerts[$f.Name] = $true
@@ -460,19 +574,56 @@ foreach ($user in $users) {
     }
 }
 
-Show-TextSpinner -Text "Patching Security Algorithms (MD5/SHA1)..." -Seconds 1
+Show-TextSpinner -Text "Patching Java Security (MD5/SHA1 + legacy TLS)..." -Seconds 1
 $javaDir = Get-Jre8Dir
 if ($javaDir) {
     $securityFile = "$javaDir\lib\security\java.security"
-    if (Test-Path $securityFile) {
-        $content = Get-Content $securityFile
+    if (Test-Path -LiteralPath $securityFile) {
+
+        # Keep one pristine copy. Never overwrite an existing .bak, so re-running this
+        # script can't destroy the original after the first patch.
+        $backupFile = "$securityFile.original.bak"
+        if (-not (Test-Path -LiteralPath $backupFile)) {
+            try {
+                Copy-Item -LiteralPath $securityFile -Destination $backupFile -Force -ErrorAction Stop
+                Write-Info "Backed up original java.security -> $(Split-Path -Leaf $backupFile)"
+            } catch {
+                Write-Attention "Could not back up java.security: $($_.Exception.Message)"
+                Add-Warning "Step 4" "java.security backup failed"
+            }
+        }
+
+        $content = Get-Content -LiteralPath $securityFile
         $content = $content -replace 'MD5, ', '' -replace 'MD2, ', ''
         $content = $content -replace '& denyAfter \d{4}-\d{2}-\d{2}', ''
         $content = $content -replace 'RSA keySize < \d+', 'RSA keySize < 512'
-        $content | Set-Content $securityFile
+
+        # Re-enable the legacy TLS protocols and ciphers that Forms 11g needs. This is
+        # the only place it can be done - deployment.security.TLSv1=true does not
+        # override jdk.tls.disabledAlgorithms.
+        $tls = Edit-SecurityListProperty -Lines $content -Property 'jdk.tls.disabledAlgorithms' -RemoveTokens $TlsReEnable
+        $content = $tls.Lines
+        if ($tls.Found) {
+            if ($tls.Removed.Count -gt 0) {
+                Write-Ok "Legacy TLS re-enabled (removed: $($tls.Removed -join ', '))"
+            } else {
+                Write-Info "Legacy TLS already enabled - nothing to remove."
+            }
+        } else {
+            Write-Attention "jdk.tls.disabledAlgorithms not found - this JRE predates it."
+        }
+
+        Set-Content -LiteralPath $securityFile -Value $content -Encoding ASCII
+
+        # An explicit jdk.tls.client.protocols would silently override all of the above
+        $clientProto = @($content | Where-Object { $_ -match '^\s*jdk\.tls\.client\.protocols\s*=' })
+        if ($clientProto.Count -gt 0) {
+            Write-Attention "jdk.tls.client.protocols is set and may override the fix: $($clientProto[0].Trim())"
+            Add-Warning "Step 4" "jdk.tls.client.protocols is set: $($clientProto[0].Trim())"
+        }
     } else {
         Write-Attention "java.security not found at $securityFile"
-        Add-Warning "Step 4" "java.security not found - algorithm patch skipped"
+        Add-Warning "Step 4" "java.security not found - algorithm and TLS patch skipped"
     }
 } else {
     Add-Warning "Step 4" "No JRE 8 present - java.security patch skipped"
@@ -489,7 +640,7 @@ $vbsCode | Out-File $vbsPath -Encoding ASCII
 # AllUsers=1 is required because %UserProfile% under elevation resolves to the
 # ADMIN's profile, not the logged-in user's.
 $ieFixFile = Join-Path $SourceDir "IEModeExpiryFix.vbs"
-if (Test-Path $ieFixFile) {
+if (Test-Path -LiteralPath $ieFixFile) {
     Write-Attention "Microsoft Edge will be closed now (the IE Mode fix requires it)."
     $iniPath = Join-Path $env:TEMP "IEModeExpiryFix.ini"
     # NOTE: this INI parser ignores any line containing more than one "=", so the

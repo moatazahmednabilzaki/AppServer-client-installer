@@ -20,7 +20,8 @@ set "SCRIPT=%~dp01-Automated_Fix.ps1"
 if not exist "%SCRIPT%" (
     echo =======================================================
     echo ERROR: 1-Automated_Fix.ps1 was not found next to this file.
-    echo Expected: %SCRIPT%
+    rem Quoted: an unquoted %SCRIPT% breaks cmd if the folder name contains ^&
+    echo Expected: "%SCRIPT%"
     echo Copy the COMPLETE package folder, then run Deploy.bat again.
     echo =======================================================
     pause
