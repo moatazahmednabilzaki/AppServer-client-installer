@@ -12,11 +12,23 @@
 
     Run via Deploy.bat (which enforces elevation). Requires Administrator.
     A full log is written to C:\ProgramData\AppServerClientInstaller\Logs.
+
+    Exit codes: 0 = success, 1 = one or more steps failed, 5 = not elevated.
 #>
+param(
+    # Unattended mode: no spinner animation, no "press any key" at the end.
+    # Set automatically by the installer when it runs /SILENT or /VERYSILENT.
+    [switch] $Silent,
+
+    # Extra folder to copy the log and summary into, so a technician can find them
+    # next to the installer instead of digging through ProgramData. Ignored if it
+    # is not writable (a read-only share or CD, for example).
+    [string] $LogCopyDir = ""
+)
 
 Start-Sleep -Milliseconds 500
-Clear-Host
-$Host.UI.RawUI.WindowTitle = "Oracle Forms 11g - Automated Deployment"
+if (-not $Silent) { Clear-Host }
+try { $Host.UI.RawUI.WindowTitle = "Oracle Forms 11g - Automated Deployment" } catch { }
 
 # =====================================================================
 #  CONFIGURATION - this is the only block you should need to edit
@@ -74,6 +86,8 @@ $script:RebootRequired = $false
 
 $Interactive = $true
 try { $Interactive = -not [Console]::IsOutputRedirected } catch { $Interactive = $false }
+# -Silent forces non-interactive: kills both the spinner animation and the final keypress
+if ($Silent) { $Interactive = $false }
 
 function Add-Failure { param([string]$Step, [string]$Message) $script:Failures += "[$Step] $Message" }
 function Add-Warning { param([string]$Step, [string]$Message) $script:Warnings += "[$Step] $Message" }
@@ -770,7 +784,71 @@ if ($script:RebootRequired) {
 }
 if ($LogFile) { Write-Host "Log saved to: $LogFile" -ForegroundColor Cyan }
 
+# ---------------------------------------------------------------------
+#  Short summary file. The full transcript can run to hundreds of KB; this is the
+#  few-KB version a customer can actually email back. Written to a stable name so
+#  support can ask for one specific file.
+# ---------------------------------------------------------------------
+$exitCode = 0
+if ($script:Failures.Count -gt 0) { $exitCode = 1 }
+
+$summary = New-Object System.Collections.Generic.List[string]
+$summary.Add("Oracle Forms 11g Client Deployment - Result Summary")
+$summary.Add("===================================================")
+$summary.Add("Computer      : $env:COMPUTERNAME")
+$summary.Add("User          : $env:USERDOMAIN\$env:USERNAME")
+$summary.Add("Date          : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+$summary.Add("Server        : $ServerHost (config=$FormsConfig)")
+$summary.Add("Package       : $SourceDir")
+$summary.Add("Silent mode   : $([bool]$Silent)")
+$summary.Add("Java 8 found  : $(if (Get-Jre8Dir) { Get-Jre8Dir } else { 'NONE' })")
+$summary.Add("Reboot needed : $script:RebootRequired")
+$summary.Add("Result        : $(if ($exitCode -eq 0) { 'SUCCESS' } else { "FAILED ($($script:Failures.Count) failure(s))" })")
+$summary.Add("Exit code     : $exitCode")
+$summary.Add("")
+if ($script:Failures.Count -gt 0) {
+    $summary.Add("FAILURES:")
+    foreach ($f in $script:Failures) { $summary.Add("  - $f") }
+    $summary.Add("")
+}
+if ($script:Warnings.Count -gt 0) {
+    $summary.Add("WARNINGS:")
+    foreach ($w in $script:Warnings) { $summary.Add("  - $w") }
+    $summary.Add("")
+}
+if ($LogFile) { $summary.Add("Full transcript: $LogFile") }
+
+$summaryFile = $null
+try {
+    if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
+    $summaryFile = Join-Path $LogDir ("LAST_RESULT_{0}.txt" -f $env:COMPUTERNAME)
+    Set-Content -LiteralPath $summaryFile -Value $summary -Encoding ASCII
+    Write-Host "Summary saved to: $summaryFile" -ForegroundColor Cyan
+} catch {
+    Write-Host "Could not write the summary file: $($_.Exception.Message)" -ForegroundColor Yellow
+    $summaryFile = $null
+}
+
 try { Stop-Transcript | Out-Null } catch { }
+
+# Copy the logs somewhere the technician will actually look (next to the installer).
+# Deliberately after Stop-Transcript so the transcript is complete and closed.
+if ($LogCopyDir) {
+    try {
+        if (-not (Test-Path -LiteralPath $LogCopyDir)) {
+            New-Item -ItemType Directory -Force -Path $LogCopyDir -ErrorAction Stop | Out-Null
+        }
+        foreach ($f in @($LogFile, $summaryFile)) {
+            if ($f -and (Test-Path -LiteralPath $f)) {
+                Copy-Item -LiteralPath $f -Destination $LogCopyDir -Force -ErrorAction Stop
+            }
+        }
+        Write-Host "Logs copied to: $LogCopyDir" -ForegroundColor Cyan
+    } catch {
+        # Read-only share, CD, or a full disk - not worth failing the deployment over
+        Write-Host "Could not copy logs to '$LogCopyDir': $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
 
 # Only wait for a key when a human is actually watching - ReadKey throws or hangs
 # under SCCM / Intune / PsExec / scheduled tasks.
@@ -780,5 +858,4 @@ if ($Interactive) {
     try { $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null } catch { }
 }
 
-if ($script:Failures.Count -gt 0) { exit 1 }
-exit 0
+exit $exitCode

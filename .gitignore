@@ -14,3 +14,10 @@ deploy_*.log
 # Adobe Reader installer binary (72 MB) - not tracked in git.
 # Must be placed alongside Deploy.bat before deployment, or Step 5 fails.
 AdbeRdr*.exe
+
+# Inno Setup build output
+dist/
+
+# Signing material - never commit
+*.pfx
+*.p12
