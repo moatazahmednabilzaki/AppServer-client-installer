@@ -3,14 +3,18 @@
     Oracle Forms 11g - Enterprise Client Deployment
 
     Steps:
-      1. Remove old Java (5 / 6)
-      2. Install the 32-bit JRE 8 shipped alongside this script
-      3. Import the SSL certificate chain
-      4. Apply Edge IE Mode + Java Control Panel policy
-      5. Install Adobe Reader XI silently
-      6. Pre-approve the Java browser plug-in (java-plugin-preapprove.reg)
-      7. Record the optional branch / lab location codes in the registry
-      8. Create the 'LDM' Edge shortcut on the public desktop
+       1. Remove old Java (5 / 6)
+       2. Install the 32-bit JRE 8 shipped alongside this script
+       3. Import the SSL certificate chain
+       4. Apply Edge IE Mode + Java Control Panel policy, including the
+          "Mixed code (sandboxed vs. trusted) security verification" setting
+       5. Install Adobe Reader XI silently
+       6. Pre-approve the Java browser plug-in (java-plugin-preapprove.reg)
+       7. Record the optional branch / lab location codes in the registry
+       8. Create the 'LDM' Edge shortcut on the public desktop
+       9. Copy the LIS folder tree to C:\LIS
+      10. Write the barcode / A4 printer names into AutoPrintFiles.exe.config
+      11. Create the 'AutoPrint' desktop shortcut
 
     Run via Deploy.bat (which enforces elevation). Requires Administrator.
     A full log is written to C:\ProgramData\AppServerClientInstaller\Logs.
@@ -37,7 +41,22 @@ param(
     # Extra folder to copy the log and summary into, so a technician can find them
     # next to the installer instead of digging through ProgramData. Ignored if it
     # is not writable (a read-only share or CD, for example).
-    [string] $LogCopyDir = ""
+    [string] $LogCopyDir = "",
+
+    # Optional printer names written into C:\LIS\app\AutoPrintFiles.exe.config
+    # (keys "BarcodPrinter" and "A4Printer" - the first is spelled without the
+    # trailing 'e' in the shipped config, and that spelling is what AutoPrintFiles
+    # actually reads, so it is preserved deliberately).
+    # Blank means "leave whatever value the config already holds", which is what
+    # makes these safe to omit when only one of the two printers is being changed.
+    [string] $BarcodePrinter = "",
+    [string] $A4Printer      = "",
+
+    # Step 9 only overwrites an existing C:\LIS when this is passed. The installer
+    # asks the technician and sets it accordingly; on a silent run the caller must
+    # opt in explicitly, so unattended deployments can never clobber the Backup,
+    # Log and back folders of a working till.
+    [switch] $LisReplace
 )
 
 Start-Sleep -Milliseconds 500
@@ -125,6 +144,12 @@ $script:Failures       = @()
 $script:Warnings       = @()
 $script:RebootRequired = $false
 $script:LastOutput     = ""   # stdout/stderr of the last Invoke-Tracked -Capture call
+# Filled in by Steps 4 / 9 / 10 / 11 so the summary file can report what actually
+# landed, rather than what was merely requested.
+$script:MixcodeApplied = ""
+$script:LisCopyResult  = "not reached"
+$script:CfgResult      = "not reached"
+$script:AutoPrintLnk   = "not reached"
 
 $Interactive = $true
 try { $Interactive = -not [Console]::IsOutputRedirected } catch { $Interactive = $false }
@@ -786,9 +811,44 @@ Show-TextSpinner -Text "Configuring Java Settings (Control Panel)..." -Seconds 2
 $mandatoryConfig = "deployment.system.config=file\:C\:/Windows/Sun/Java/Deployment/deployment.properties`r`ndeployment.system.config.mandatory=true"
 [System.IO.File]::WriteAllText("$sysDeployDir\deployment.config", $mandatoryConfig)
 
-# Set properties without locking them, allowing manual override
-$props = "deployment.security.level=HIGH`r`ndeployment.security.mixcode=HIDE_UNTRUSTED`r`ndeployment.security.revocation.check=NO_CHECK`r`ndeployment.security.tls.revocation.check=NO_CHECK`r`ndeployment.security.validation.crl=false`r`ndeployment.security.validation.ocsp=false`r`ndeployment.security.TLSv1=true`r`ndeployment.security.TLSv1.1=true`r`ndeployment.javaws.jre.0.args=-Dsun.java2d.noddraw=true -Dsun.java2d.d3d=false`r`ndeployment.user.security.exception.sites=C:/Windows/Sun/Java/Deployment/security/exception.sites`r`ndeployment.expiration.check.enabled=false`r`ndeployment.javaws.autodownload=NEVER"
+# Set properties without locking them, allowing manual override.
+#
+# deployment.security.mixcode drives Java Control Panel > Advanced > "Mixed code
+# (sandboxed vs. trusted) security verification". Java accepts exactly four values,
+# confirmed against the MIXCODE_MODE_* constants in com.sun.deploy.config.Config
+# inside deploy.jar:
+#
+#   ENABLE      -> "Enable - show warning if needed"                    (Java default)
+#   HIDE_RUN    -> "Enable - hide warning and run with protections"
+#   HIDE_CANCEL -> "Enable - hide warning and don't run untrusted code" <-- required
+#   DISABLE     -> "Disable verification (not recommended)"
+#
+# Anything else is silently discarded and Java falls back to ENABLE, i.e. the mixed
+# code warning keeps appearing. Earlier versions of this script wrote HIDE_UNTRUSTED,
+# which is not one of the four, so the setting never actually took effect on a client.
+# Do not "tidy" this value.
+$props = "deployment.security.level=HIGH`r`ndeployment.security.mixcode=HIDE_CANCEL`r`ndeployment.security.revocation.check=NO_CHECK`r`ndeployment.security.tls.revocation.check=NO_CHECK`r`ndeployment.security.validation.crl=false`r`ndeployment.security.validation.ocsp=false`r`ndeployment.security.TLSv1=true`r`ndeployment.security.TLSv1.1=true`r`ndeployment.javaws.jre.0.args=-Dsun.java2d.noddraw=true -Dsun.java2d.d3d=false`r`ndeployment.user.security.exception.sites=C:/Windows/Sun/Java/Deployment/security/exception.sites`r`ndeployment.expiration.check.enabled=false`r`ndeployment.javaws.autodownload=NEVER"
 [System.IO.File]::WriteAllText("$sysDeployDir\deployment.properties", $props)
+
+# Read the mixed-code setting back out of the file that Java will actually load, rather
+# than trusting the write. This is the one Control Panel setting the customer asked to
+# be able to confirm, so it gets its own line in the log instead of being buried.
+$mixWanted = "HIDE_CANCEL"
+$mixActual = $null
+try {
+    $mixLine = Get-Content -LiteralPath "$sysDeployDir\deployment.properties" -ErrorAction Stop |
+               Where-Object { $_ -match '^\s*deployment\.security\.mixcode\s*=' } |
+               Select-Object -Last 1
+    if ($mixLine) { $mixActual = ($mixLine -split '=', 2)[1].Trim() }
+} catch { $mixActual = $null }
+
+$script:MixcodeApplied = $mixActual
+if ($mixActual -eq $mixWanted) {
+    Write-Ok "Mixed code security verification = $mixActual (Enable - hide warning and don't run untrusted code)"
+} else {
+    Write-Bad "Mixed code security verification is '$mixActual', expected '$mixWanted'."
+    Add-Failure "Step 4" "deployment.security.mixcode read back as '$mixActual' instead of '$mixWanted'"
+}
 
 # Drop system config into the JRE lib folder as the ultimate override (but not mandatory)
 $jreLibConfig = "deployment.system.config=file\:C\:/Windows/Sun/Java/Deployment/deployment.properties"
@@ -1098,6 +1158,234 @@ if (-not $edgeExe) {
 }
 
 # =====================================================================
+# STEP 9: Copy the LIS folder tree to C:\LIS
+# =====================================================================
+Write-StepTitle "[Step 9] Deploying the LIS folder to C:\LIS..."
+
+$LisDest = "C:\LIS"
+$lisSrc  = $null
+foreach ($dir in $SearchDirs) {
+    $candidate = Join-Path $dir "LIS"
+    if (Test-Path -LiteralPath $candidate -PathType Container) { $lisSrc = $candidate; break }
+}
+
+if (-not $lisSrc) {
+    Write-Bad "No 'LIS' folder found in the package - nothing to copy."
+    foreach ($d in $SearchDirs) { Write-Host "        $d" -ForegroundColor Red }
+    Add-Failure "Step 9" "LIS source folder missing from the package"
+    $script:LisCopyResult = "FAILED (source missing)"
+} else {
+    Write-Info "Source: $lisSrc"
+    $destExisted = Test-Path -LiteralPath $LisDest -PathType Container
+
+    if ($destExisted -and (-not $LisReplace)) {
+        # The technician answered No (or a silent run did not opt in). Bypassing the copy
+        # and carrying on is the documented behaviour - C:\LIS\Barcode\Backup and
+        # C:\LIS\log on a live till hold data nobody wants silently overwritten.
+        Write-Skip "$LisDest already exists and replace was declined - folder left untouched."
+        Write-Info "Step 10 will still update the printer names in the existing config."
+        $script:LisCopyResult = "skipped (existing folder kept)"
+    } else {
+        if ($destExisted) {
+            Write-Info "$LisDest exists and replace was approved - files will be overwritten."
+        }
+        try {
+            if (-not $destExisted) {
+                New-Item -ItemType Directory -Force -Path $LisDest -ErrorAction Stop | Out-Null
+            }
+
+            # robocopy /E rather than Copy-Item -Recurse: /E recreates the empty folders the
+            # package ships on purpose (A4\Backup, Barcode\Backup, Barcode\Log, back, log),
+            # which AutoPrintFiles expects to already exist. No /PURGE - overwrite what we
+            # ship, but never delete a file the client put there.
+            $rcOut = & robocopy $lisSrc $LisDest /E /R:1 /W:1 /NP /NJH /NJS 2>&1
+            $rc    = $LASTEXITCODE
+            Write-CapturedOutput -Label "robocopy" -Text ($rcOut | Out-String) -MaxLines 20
+
+            # robocopy is not a normal exit code: bits 0-3 are "work done", 8 and above
+            # are real failures. Treating anything non-zero as an error would fail every
+            # successful copy.
+            if ($rc -ge 8) {
+                Write-Bad "robocopy reported failure (exit $rc) copying to $LisDest."
+                Add-Failure "Step 9" "robocopy exit $rc while copying LIS to $LisDest"
+                $script:LisCopyResult = "FAILED (robocopy $rc)"
+            } else {
+                # Verify the payload landed rather than trusting the exit code
+                $probe = Join-Path $LisDest "app\AutoPrintFiles.exe"
+                if (Test-Path -LiteralPath $probe) {
+                    $n = @(Get-ChildItem -LiteralPath $LisDest -Recurse -File -ErrorAction SilentlyContinue).Count
+                    Write-Ok "$(if ($destExisted) { 'Replaced' } else { 'Created' }) $LisDest ($n file(s), robocopy $rc)"
+                    $script:LisCopyResult = "$(if ($destExisted) { 'replaced' } else { 'created' }) ($n files)"
+                } else {
+                    Write-Bad "Copy finished but $probe is missing."
+                    Add-Failure "Step 9" "AutoPrintFiles.exe missing from $LisDest after copy"
+                    $script:LisCopyResult = "FAILED (payload incomplete)"
+                }
+            }
+        } catch {
+            Write-Bad "Could not copy the LIS folder: $($_.Exception.Message)"
+            Add-Failure "Step 9" "LIS copy failed: $($_.Exception.Message)"
+            $script:LisCopyResult = "FAILED ($($_.Exception.Message))"
+        }
+    }
+}
+
+# =====================================================================
+# STEP 10: Write the printer names into AutoPrintFiles.exe.config
+# =====================================================================
+Write-StepTitle "[Step 10] Setting the barcode / A4 printer names..."
+
+$AutoPrintDir = Join-Path $LisDest "app"
+$cfgPath      = Join-Path $AutoPrintDir "AutoPrintFiles.exe.config"
+
+if (-not $BarcodePrinter -and -not $A4Printer) {
+    Write-Skip "No printer names supplied - the config file was left unchanged."
+    $script:CfgResult = "unchanged (no printers supplied)"
+} elseif (-not (Test-Path -LiteralPath $cfgPath)) {
+    Write-Bad "$cfgPath not found - the printer names were not written."
+    Add-Failure "Step 10" "AutoPrintFiles.exe.config not found at $cfgPath"
+    $script:CfgResult = "FAILED (config not found)"
+} else {
+    try {
+        # Parsed as XML, not rewritten with a regex: the file is a .NET app.config and a
+        # botched value attribute makes AutoPrintFiles fail to start with a
+        # ConfigurationErrorsException rather than just printing to the wrong device.
+        $xml = New-Object System.Xml.XmlDocument
+        $xml.PreserveWhitespace = $true
+        $xml.Load($cfgPath)
+
+        $appSettings = $xml.SelectSingleNode("/configuration/appSettings")
+        if (-not $appSettings) { throw "no <appSettings> section in the config file" }
+
+        # Keeps a copy of the config as found, once per run, before the first change
+        $bak = "$cfgPath.bak"
+        Copy-Item -LiteralPath $cfgPath -Destination $bak -Force -ErrorAction SilentlyContinue
+
+        # "BarcodPrinter" is the spelling in the shipped config and the one
+        # AutoPrintFiles reads. "BarcodePrinter" is accepted as an alias only because a
+        # client config may already have been hand-corrected; whichever key is present
+        # is the one updated, and neither spelling is added alongside the other.
+        $targets = @(
+            @{ Label = "Barcode printer"; Value = $BarcodePrinter; Keys = @("BarcodPrinter", "BarcodePrinter") },
+            @{ Label = "A4 printer";      Value = $A4Printer;      Keys = @("A4Printer")                       }
+        )
+
+        $changed = @()
+        foreach ($t in $targets) {
+            if (-not $t.Value) {
+                Write-Skip "$($t.Label): not supplied, existing value kept."
+                continue
+            }
+
+            $node = $null
+            foreach ($k in $t.Keys) {
+                $node = $appSettings.SelectSingleNode("add[@key='$k']")
+                if ($node) { break }
+            }
+
+            if ($node) {
+                $old = $node.GetAttribute("value")
+                $node.SetAttribute("value", $t.Value)
+                if ($old -eq $t.Value) {
+                    Write-Ok "$($t.Label): already '$($t.Value)', unchanged."
+                } else {
+                    Write-Ok "$($t.Label): '$old' -> '$($t.Value)'"
+                }
+                $changed += "$($node.GetAttribute('key'))=$($t.Value)"
+            } else {
+                # Absent key: add it under the canonical shipped spelling
+                $new = $xml.CreateElement("add")
+                $new.SetAttribute("key",   $t.Keys[0])
+                $new.SetAttribute("value", $t.Value)
+                $appSettings.AppendChild($new) | Out-Null
+                Write-Ok "$($t.Label): key '$($t.Keys[0])' was missing, added = '$($t.Value)'"
+                $changed += "$($t.Keys[0])=$($t.Value)"
+            }
+        }
+
+        $xml.Save($cfgPath)
+
+        # Read the file back from disk and confirm what a fresh XML parse sees, so a
+        # save that silently produced an unusable file cannot be reported as success.
+        $verify = New-Object System.Xml.XmlDocument
+        $verify.Load($cfgPath)
+        $bad = @()
+        foreach ($t in $targets) {
+            if (-not $t.Value) { continue }
+            $got = $null
+            foreach ($k in $t.Keys) {
+                $n = $verify.SelectSingleNode("/configuration/appSettings/add[@key='$k']")
+                if ($n) { $got = $n.GetAttribute("value"); break }
+            }
+            if ($got -ne $t.Value) { $bad += "$($t.Label) read back as '$got'" }
+        }
+
+        if ($bad.Count -gt 0) {
+            foreach ($b in $bad) { Write-Bad $b }
+            Add-Failure "Step 10" ($bad -join "; ")
+            $script:CfgResult = "FAILED (" + ($bad -join "; ") + ")"
+        } else {
+            Write-Ok "Verified in $cfgPath"
+            $script:CfgResult = ($changed -join ", ")
+        }
+    } catch {
+        Write-Bad "Could not update the config file: $($_.Exception.Message)"
+        Add-Failure "Step 10" "AutoPrintFiles.exe.config update failed: $($_.Exception.Message)"
+        $script:CfgResult = "FAILED ($($_.Exception.Message))"
+    }
+}
+
+# =====================================================================
+# STEP 11: 'AutoPrint' desktop shortcut
+# =====================================================================
+Write-StepTitle "[Step 11] Creating the 'AutoPrint' shortcut on the desktop..."
+
+$autoPrintExe = Join-Path $AutoPrintDir "AutoPrintFiles.exe"
+if (-not (Test-Path -LiteralPath $autoPrintExe)) {
+    Write-Bad "$autoPrintExe not found - the AutoPrint shortcut was not created."
+    Add-Failure "Step 11" "AutoPrintFiles.exe not found at $autoPrintExe"
+    $script:AutoPrintLnk = "FAILED (target missing)"
+} else {
+    # Public Desktop, matching the LDM shortcut in Step 8, so every user of the till
+    # gets it rather than only the account the technician happened to install under.
+    $desktopDir  = Join-Path $env:PUBLIC "Desktop"
+    $apLnk       = Join-Path $desktopDir "AutoPrint.lnk"
+    $shellAp     = $null
+    try {
+        if (-not (Test-Path -LiteralPath $desktopDir)) {
+            New-Item -ItemType Directory -Force -Path $desktopDir -ErrorAction Stop | Out-Null
+        }
+        $shellAp = New-Object -ComObject WScript.Shell
+        $sc = $shellAp.CreateShortcut($apLnk)
+        $sc.TargetPath       = $autoPrintExe
+        # WorkingDirectory matters here: AutoPrintFiles resolves its .config and the
+        # relative folders it watches against the current directory.
+        $sc.WorkingDirectory = $AutoPrintDir
+        $sc.IconLocation     = "$autoPrintExe,0"
+        $sc.Description      = "LIS AutoPrint - barcode and A4 print service"
+        $sc.Save()
+
+        if (Test-Path -LiteralPath $apLnk) {
+            Write-Ok "Created: $apLnk"
+            Write-Info "Target: $autoPrintExe"
+            $script:AutoPrintLnk = "created"
+        } else {
+            Write-Bad "Save() reported no error but $apLnk does not exist."
+            Add-Failure "Step 11" "AutoPrint shortcut was not created at $apLnk"
+            $script:AutoPrintLnk = "FAILED (not created)"
+        }
+    } catch {
+        Write-Bad "Could not create the AutoPrint shortcut: $($_.Exception.Message)"
+        Add-Failure "Step 11" "AutoPrint desktop shortcut failed: $($_.Exception.Message)"
+        $script:AutoPrintLnk = "FAILED ($($_.Exception.Message))"
+    } finally {
+        if ($shellAp) {
+            try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shellAp) | Out-Null } catch { }
+        }
+    }
+}
+
+# =====================================================================
 #  Result
 # =====================================================================
 Write-Host ""
@@ -1146,6 +1434,12 @@ $summary.Add("Server        : $ServerAuthority$(if ($FormsConfig) { " (config=$F
 $summary.Add("Branch code   : $(if ($BranchCode) { "$BranchCode -> $(Get-Hklm64String -SubKey 'SOFTWARE\WOW6432Node\branch_code'  -ValueName 'branch_code')"  } else { '(not supplied)' })")
 $summary.Add("Lab code      : $(if ($LabCode)    { "$LabCode -> $(Get-Hklm64String -SubKey 'SOFTWARE\WOW6432Node\lab_location' -ValueName 'lab_location')" } else { '(not supplied)' })")
 $summary.Add("LDM shortcut  : $(if (Test-Path -LiteralPath (Join-Path $env:PUBLIC 'Desktop\LDM.lnk')) { 'created' } else { 'MISSING' })")
+$summary.Add("Mixed code    : $(if ($script:MixcodeApplied) { $script:MixcodeApplied } else { '(not applied)' })")
+$summary.Add("LIS folder    : $script:LisCopyResult")
+$summary.Add("Barcode ptr   : $(if ($BarcodePrinter) { $BarcodePrinter } else { '(not supplied)' })")
+$summary.Add("A4 printer    : $(if ($A4Printer)      { $A4Printer      } else { '(not supplied)' })")
+$summary.Add("AutoPrint cfg : $script:CfgResult")
+$summary.Add("AutoPrint lnk : $script:AutoPrintLnk")
 $summary.Add("Package       : $SourceDir")
 $summary.Add("Silent mode   : $([bool]$Silent)")
 $summary.Add("Java 8 found  : $(if (Get-Jre8Dir) { Get-Jre8Dir } else { 'NONE' })")
